@@ -20,32 +20,60 @@ import { Link } from 'react-router-dom';
 import dayjs from 'dayjs';
 import StatusBadge from '../components/common/StatusBadge';
 import EmptyState from '../components/common/EmptyState';
+import RecheckTimeline from '../components/common/RecheckTimeline';
 import { useInspectionFilter } from '../hooks/useInspectionFilter';
 import { usePointStore } from '../stores/pointStore';
 import { DISTRICTS, FACILITY_TYPES } from '../types/point';
-import { RECTIFY_STATUSES, type RectifyPlan, type RectifyStatus } from '../types/rectify';
+import {
+  RECTIFY_STATUSES,
+  sortRechecksDesc,
+  type RecheckRecord,
+  type RectifyPlan,
+  type RectifyStatus,
+} from '../types/rectify';
 import { isOverdue, todayStr } from '../utils/format';
 
 interface RecheckDraft {
   status: RectifyStatus;
   recheckDate: string;
   note: string;
+  inspector: string;
 }
+
+const EMPTY_DRAFT: RecheckDraft = {
+  status: '已整改',
+  recheckDate: todayStr(),
+  note: '',
+  inspector: '督导员 李维',
+};
 
 export default function Rectify() {
   const { message } = App.useApp();
   const { filter, setFilter, resetFilter, pendingRectifies, pointMap } = useInspectionFilter();
   const rectifies = usePointStore((s) => s.rectifies);
-  const updateRectify = usePointStore((s) => s.updateRectify);
+  const rechecks = usePointStore((s) => s.rechecks);
+  const addRecheck = usePointStore((s) => s.addRecheck);
   const [statusFilter, setStatusFilter] = useState<RectifyStatus | ''>('');
   const [editing, setEditing] = useState<RectifyPlan | null>(null);
-  const [draft, setDraft] = useState<RecheckDraft>({ status: '已整改', recheckDate: todayStr(), note: '' });
+  const [draft, setDraft] = useState<RecheckDraft>(EMPTY_DRAFT);
   const [saving, setSaving] = useState(false);
 
   const scoped = useMemo(
     () => rectifies.filter((r) => pointMap.has(r.pointId)),
     [rectifies, pointMap],
   );
+
+  /** 每条整改条目的复检记录，按时间倒序 */
+  const rechecksByRectify = useMemo(() => {
+    const map = new Map<string, RecheckRecord[]>();
+    for (const r of rechecks) {
+      const list = map.get(r.rectifyId);
+      if (list) list.push(r);
+      else map.set(r.rectifyId, [r]);
+    }
+    for (const list of map.values()) list.sort(sortRechecksDesc);
+    return map;
+  }, [rechecks]);
 
   const visible = useMemo(
     () => (statusFilter ? scoped.filter((r) => r.status === statusFilter) : scoped),
@@ -73,20 +101,20 @@ export default function Rectify() {
 
   const openRecheck = (row: RectifyPlan) => {
     setEditing(row);
-    setDraft({ status: '已整改', recheckDate: todayStr(), note: '' });
+    setDraft({ ...EMPTY_DRAFT, recheckDate: todayStr() });
   };
 
   const handleRecheck = async () => {
     if (!editing) return;
     setSaving(true);
     try {
-      const requirement = draft.note.trim()
-        ? `${editing.requirement}｜复检说明：${draft.note.trim()}`
-        : editing.requirement;
-      await updateRectify(editing.id, {
-        status: draft.status,
-        recheckDate: draft.recheckDate || todayStr(),
-        requirement,
+      // 每次登记单独存一条复检记录，整改要求原文不再改动
+      await addRecheck({
+        rectifyId: editing.id,
+        conclusion: draft.status,
+        date: draft.recheckDate || todayStr(),
+        note: draft.note,
+        inspector: draft.inspector,
       });
       message.success('复检结果已登记');
       setEditing(null);
@@ -135,6 +163,16 @@ export default function Rectify() {
       render: (v: string) => v || <Typography.Text type="secondary">未复检</Typography.Text>,
     },
     {
+      title: '最新复检说明',
+      width: 220,
+      ellipsis: true,
+      render: (_, row) => {
+        const latest = rechecksByRectify.get(row.id)?.[0];
+        if (!latest) return <Typography.Text type="secondary">—</Typography.Text>;
+        return latest.note || <Typography.Text type="secondary">未填写说明</Typography.Text>;
+      },
+    },
+    {
       title: '状态',
       dataIndex: 'status',
       width: 100,
@@ -157,7 +195,7 @@ export default function Rectify() {
         <div>
           <h1 className="gb-page-title">整改清单</h1>
           <Typography.Text type="secondary">
-            按状态与期限分组，逾期条目置顶；登记复检结果后自动回流到点位详情。
+            按状态与期限分组，逾期条目置顶；每次复检单独存档，展开行可查看历次记录与最新说明。
           </Typography.Text>
         </div>
         <Space wrap>
@@ -253,6 +291,12 @@ export default function Rectify() {
               dataSource={g.items}
               columns={columns}
               rowClassName={(row) => (isOverdue(row.deadline, row.status) ? 'gb-overdue-row' : '')}
+              expandable={{
+                rowExpandable: (row) => (rechecksByRectify.get(row.id)?.length ?? 0) > 0,
+                expandedRowRender: (row) => (
+                  <RecheckTimeline records={rechecksByRectify.get(row.id) ?? []} />
+                ),
+              }}
             />
           </Card>
         ))
@@ -283,6 +327,8 @@ export default function Rectify() {
               整改要求：{editing.requirement}
               <br />
               责任单位：{editing.unit} · 期限：{editing.deadline}
+              <br />
+              已有 {rechecksByRectify.get(editing.id)?.length ?? 0} 条复检记录，本次登记将新增一条，由最新记录决定条目状态
             </Typography.Text>
             <div>
               <Typography.Text>复检结论</Typography.Text>
@@ -303,6 +349,16 @@ export default function Rectify() {
                 style={{ width: '100%', marginTop: 4 }}
                 value={draft.recheckDate ? dayjs(draft.recheckDate) : null}
                 onChange={(d) => setDraft((c) => ({ ...c, recheckDate: d ? d.format('YYYY-MM-DD') : todayStr() }))}
+              />
+            </div>
+            <div>
+              <Typography.Text>检查人</Typography.Text>
+              <Input
+                style={{ marginTop: 4 }}
+                value={draft.inspector}
+                onChange={(e) => setDraft((c) => ({ ...c, inspector: e.target.value }))}
+                placeholder="如：督导员 李维"
+                data-testid="recheck-inspector"
               />
             </div>
             <div>

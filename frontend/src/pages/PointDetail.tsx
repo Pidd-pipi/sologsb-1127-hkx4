@@ -25,9 +25,10 @@ import MeasureInput from '../components/common/MeasureInput';
 import StatusBadge from '../components/common/StatusBadge';
 import FacilityIcon from '../components/common/FacilityIcon';
 import EmptyState from '../components/common/EmptyState';
+import RecheckTimeline from '../components/common/RecheckTimeline';
 import { usePointStore } from '../stores/pointStore';
 import { OCCUPIED_LEVELS, type Inspection, type OccupiedLevel } from '../types/inspection';
-import type { RectifyPlan } from '../types/rectify';
+import { sortRechecksDesc, type RecheckRecord, type RectifyPlan } from '../types/rectify';
 import { judgeInspection } from '../utils/routeCheck';
 import { addDays, isOverdue, todayStr } from '../utils/format';
 
@@ -48,6 +49,7 @@ export default function PointDetail() {
   const points = usePointStore((s) => s.points);
   const inspections = usePointStore((s) => s.inspections);
   const rectifies = usePointStore((s) => s.rectifies);
+  const rechecks = usePointStore((s) => s.rechecks);
   const loaded = usePointStore((s) => s.loaded);
   const addInspection = usePointStore((s) => s.addInspection);
   const addRectify = usePointStore((s) => s.addRectify);
@@ -65,6 +67,17 @@ export default function PointDetail() {
       rectifies.filter((r) => r.pointId === id).sort((a, b) => (a.deadline < b.deadline ? -1 : 1)),
     [rectifies, id],
   );
+  /** 每条整改条目的复检记录，按时间倒序 */
+  const rechecksByRectify = useMemo(() => {
+    const map = new Map<string, RecheckRecord[]>();
+    for (const r of rechecks) {
+      const list = map.get(r.rectifyId);
+      if (list) list.push(r);
+      else map.set(r.rectifyId, [r]);
+    }
+    for (const list of map.values()) list.sort(sortRechecksDesc);
+    return map;
+  }, [rechecks]);
 
   const [form, setForm] = useState<InlineInspection>(() => ({
     date: todayStr(),
@@ -204,6 +217,16 @@ export default function PointDetail() {
       dataIndex: 'recheckDate',
       width: 120,
       render: (v: string) => v || <Typography.Text type="secondary">未复检</Typography.Text>,
+    },
+    {
+      title: '最新复检说明',
+      width: 200,
+      ellipsis: true,
+      render: (_, row) => {
+        const latest = rechecksByRectify.get(row.id)?.[0];
+        if (!latest) return <Typography.Text type="secondary">—</Typography.Text>;
+        return latest.note || <Typography.Text type="secondary">未填写说明</Typography.Text>;
+      },
     },
     {
       title: '状态',
@@ -408,7 +431,19 @@ export default function PointDetail() {
       <Card title="整改跟踪" size="small" style={{ marginTop: 16 }}>
         <Divider style={{ margin: '0 0 12px' }} />
         {plans.length ? (
-          <Table<RectifyPlan> rowKey="id" size="small" pagination={false} dataSource={plans} columns={rectifyColumns} />
+          <Table<RectifyPlan>
+            rowKey="id"
+            size="small"
+            pagination={false}
+            dataSource={plans}
+            columns={rectifyColumns}
+            expandable={{
+              rowExpandable: (row) => (rechecksByRectify.get(row.id)?.length ?? 0) > 0,
+              expandedRowRender: (row) => (
+                <RecheckTimeline records={rechecksByRectify.get(row.id) ?? []} />
+              ),
+            }}
+          />
         ) : (
           <EmptyState
             title="暂无整改条目"

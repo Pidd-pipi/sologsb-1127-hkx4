@@ -2,23 +2,28 @@ import Dexie, { type Table } from 'dexie';
 import type { AccessPoint } from '../types/point';
 import type { Inspection } from '../types/inspection';
 import type { RouteSegment } from '../types/route';
-import type { RectifyPlan } from '../types/rectify';
+import type { RecheckRecord, RectifyPlan } from '../types/rectify';
 import { addDays, makeId, todayStr, toPlain } from '../utils/format';
 import { judgeInspection } from '../utils/routeCheck';
 
 export const DB_NAME = 'gbaccessmap-db';
+
+/** 旧版本把复检说明拼接在整改要求后的分隔标记 */
+const LEGACY_NOTE_MARK = '｜复检说明：';
 
 /**
  * 浏览器本地库：IndexedDB（Dexie）
  * v1 建 points / inspections
  * v2 加 routes 表与 pointId 索引
  * v3 加 rectifies 表，并为历史不合格核验补建整改条目
+ * v4 加 rechecks 表，每次复检登记单独一条；为已有复检日期的条目补录复检记录
  */
 class AccessMapDb extends Dexie {
   points!: Table<AccessPoint, string>;
   inspections!: Table<Inspection, string>;
   routes!: Table<RouteSegment, string>;
   rectifies!: Table<RectifyPlan, string>;
+  rechecks!: Table<RecheckRecord, string>;
 
   constructor() {
     super(DB_NAME);
@@ -68,6 +73,38 @@ class AccessMapDb extends Dexie {
             deadline: addDays(insp.date || todayStr(), 30),
             recheckDate: '',
             status: '待整改',
+            createdAt: new Date().toISOString(),
+          });
+        }
+      });
+    this.version(4)
+      .stores({
+        points: 'id, code, facilityType, district, name',
+        inspections: 'id, pointId, date, conclusion',
+        routes: 'id, routeName, fromPointId, toPointId, order',
+        rectifies: 'id, pointId, status, deadline',
+        rechecks: 'id, rectifyId, date',
+      })
+      .upgrade(async (tx) => {
+        // v4：为已有复检日期的条目补录一条复检记录；没有复检日期的保持未复检。
+        // 同时把旧版拼进整改要求里的「｜复检说明：…」拆出来，还原整改要求原文。
+        const rectifies: RectifyPlan[] = await tx.table('rectifies').toArray();
+        const rechecksTable = tx.table('rechecks');
+        for (const r of rectifies) {
+          const [base, ...notes] = (r.requirement || '').split(LEGACY_NOTE_MARK);
+          if (notes.length > 0) {
+            await tx.table('rectifies').update(r.id, { requirement: base });
+          }
+          if (!r.recheckDate) continue;
+          const existed = await rechecksTable.where('rectifyId').equals(r.id).first();
+          if (existed) continue;
+          await rechecksTable.add({
+            id: `rck-mig-${r.id}`,
+            rectifyId: r.id,
+            conclusion: r.status,
+            date: r.recheckDate,
+            note: notes.join('；'),
+            inspector: '历史登记',
             createdAt: new Date().toISOString(),
           });
         }
@@ -386,7 +423,18 @@ function buildSeed() {
       createdAt: now,
     },
   ];
-  return { points, inspections, routes, rectifies };
+  const rechecks: RecheckRecord[] = rectifies
+    .filter((r) => r.recheckDate)
+    .map((r) => ({
+      id: `rck-seed-${r.id}`,
+      rectifyId: r.id,
+      conclusion: r.status,
+      date: r.recheckDate,
+      note: '盲文标识已更换，现场复测合格',
+      inspector: '督导员 陈默',
+      createdAt: now,
+    }));
+  return { points, inspections, routes, rectifies, rechecks };
 }
 
 /** 首次打开时写入示例数据；已有数据则跳过 */
@@ -394,11 +442,12 @@ export async function ensureSeed(): Promise<void> {
   const count = await db.points.count();
   if (count > 0) return;
   const seed = toPlain(buildSeed());
-  await db.transaction('rw', db.points, db.inspections, db.routes, db.rectifies, async () => {
+  await db.transaction('rw', db.points, db.inspections, db.routes, db.rectifies, db.rechecks, async () => {
     await db.points.bulkPut(seed.points);
     await db.inspections.bulkPut(seed.inspections);
     await db.routes.bulkPut(seed.routes);
     await db.rectifies.bulkPut(seed.rectifies);
+    await db.rechecks.bulkPut(seed.rechecks);
   });
 }
 
