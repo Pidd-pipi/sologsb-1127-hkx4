@@ -2,23 +2,28 @@ import Dexie, { type Table } from 'dexie';
 import type { AccessPoint } from '../types/point';
 import type { Inspection } from '../types/inspection';
 import type { RouteSegment } from '../types/route';
-import type { RectifyPlan } from '../types/rectify';
+import type { RectifyPlan, RecheckRecord } from '../types/rectify';
 import { addDays, makeId, todayStr, toPlain } from '../utils/format';
 import { judgeInspection } from '../utils/routeCheck';
 
 export const DB_NAME = 'gbaccessmap-db';
+
+/** 旧版本把复检说明拼在整改要求后的分隔标记 */
+const LEGACY_NOTE_MARK = '｜复检说明：';
 
 /**
  * 浏览器本地库：IndexedDB（Dexie）
  * v1 建 points / inspections
  * v2 加 routes 表与 pointId 索引
  * v3 加 rectifies 表，并为历史不合格核验补建整改条目
+ * v4 加 rechecks 表：复检登记单独成记录，并把旧复检日期回填为一条历史记录
  */
 class AccessMapDb extends Dexie {
   points!: Table<AccessPoint, string>;
   inspections!: Table<Inspection, string>;
   routes!: Table<RouteSegment, string>;
   rectifies!: Table<RectifyPlan, string>;
+  rechecks!: Table<RecheckRecord, string>;
 
   constructor() {
     super(DB_NAME);
@@ -69,6 +74,45 @@ class AccessMapDb extends Dexie {
             recheckDate: '',
             status: '待整改',
             createdAt: new Date().toISOString(),
+          });
+        }
+      });
+    this.version(4)
+      .stores({
+        points: 'id, code, facilityType, district, name',
+        inspections: 'id, pointId, date, conclusion',
+        routes: 'id, routeName, fromPointId, toPointId, order',
+        rectifies: 'id, pointId, status, deadline',
+        rechecks: 'id, rectifyId, date',
+      })
+      .upgrade(async (tx) => {
+        // v4：复检记录单独建表。旧条目有复检日期的补一条历史记录，
+        // 没有复检日期的仍是「未复检」，不补记录。
+        const rectifyTable = tx.table<RectifyPlan, string>('rectifies');
+        const recheckTable = tx.table<RecheckRecord, string>('rechecks');
+        const rows = await rectifyTable.toArray();
+        for (const row of rows) {
+          if (!row.recheckDate) continue;
+          // 已回填过（重复升级）则跳过，同一条目只补第一条
+          const existed = await recheckTable.where('rectifyId').equals(row.id).count();
+          if (existed > 0) continue;
+          // 把旧版本拼进整改要求的复检说明拆回独立字段
+          let requirement = row.requirement;
+          let note = '';
+          const markIdx = row.requirement.indexOf(LEGACY_NOTE_MARK);
+          if (markIdx >= 0) {
+            requirement = row.requirement.slice(0, markIdx);
+            note = row.requirement.slice(markIdx + LEGACY_NOTE_MARK.length);
+            await rectifyTable.update(row.id, { requirement });
+          }
+          await recheckTable.add({
+            id: `rck-mig-${row.id}`,
+            rectifyId: row.id,
+            result: row.status === '复发' ? '复发' : row.status === '待整改' ? '待整改' : '已整改',
+            date: row.recheckDate,
+            note,
+            inspector: '',
+            createdAt: row.createdAt,
           });
         }
       });
@@ -385,8 +429,48 @@ function buildSeed() {
       status: '已整改',
       createdAt: now,
     },
+    {
+      id: 'rct-seed-5',
+      pointId: 'pt-1005',
+      requirement: '修复无障碍卫生间门锁，加装紧急呼叫按钮',
+      unit: '城管委设施科',
+      deadline: addDays(today, -25),
+      recheckDate: addDays(today, -8),
+      status: '复发',
+      createdAt: now,
+    },
   ];
-  return { points, inspections, routes, rectifies };
+  // 复检记录单独存放，按时间保留历次登记；最新一条决定条目状态
+  const rechecks: RecheckRecord[] = [
+    {
+      id: 'rck-seed-4',
+      rectifyId: 'rct-seed-4',
+      result: '已整改',
+      date: addDays(today, -12),
+      note: '盲文标识已更换，抽检轿厢各楼层按钮标识清晰',
+      inspector: '督导员 陈默',
+      createdAt: now,
+    },
+    {
+      id: 'rck-seed-5-1',
+      rectifyId: 'rct-seed-5',
+      result: '已整改',
+      date: addDays(today, -20),
+      note: '门锁已修复，紧急呼叫按钮加装到位，现场试用正常',
+      inspector: '督导员 赵敏',
+      createdAt: now,
+    },
+    {
+      id: 'rck-seed-5-2',
+      rectifyId: 'rct-seed-5',
+      result: '复发',
+      date: addDays(today, -8),
+      note: '回访发现呼叫按钮再次失灵、门锁损坏无法闭合，需重新整改',
+      inspector: '督导员 赵敏',
+      createdAt: now,
+    },
+  ];
+  return { points, inspections, routes, rectifies, rechecks };
 }
 
 /** 首次打开时写入示例数据；已有数据则跳过 */
@@ -394,12 +478,21 @@ export async function ensureSeed(): Promise<void> {
   const count = await db.points.count();
   if (count > 0) return;
   const seed = toPlain(buildSeed());
-  await db.transaction('rw', db.points, db.inspections, db.routes, db.rectifies, async () => {
-    await db.points.bulkPut(seed.points);
-    await db.inspections.bulkPut(seed.inspections);
-    await db.routes.bulkPut(seed.routes);
-    await db.rectifies.bulkPut(seed.rectifies);
-  });
+  await db.transaction(
+    'rw',
+    db.points,
+    db.inspections,
+    db.routes,
+    db.rectifies,
+    db.rechecks,
+    async () => {
+      await db.points.bulkPut(seed.points);
+      await db.inspections.bulkPut(seed.inspections);
+      await db.routes.bulkPut(seed.routes);
+      await db.rectifies.bulkPut(seed.rectifies);
+      await db.rechecks.bulkPut(seed.rechecks);
+    },
+  );
 }
 
 export { makeId };

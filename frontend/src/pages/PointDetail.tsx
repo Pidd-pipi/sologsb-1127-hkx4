@@ -15,10 +15,11 @@ import {
   Switch,
   Table,
   Tag,
+  Timeline,
   Typography,
 } from 'antd';
 import type { ColumnsType } from 'antd/es/table';
-import { PlusOutlined, SaveOutlined, ReloadOutlined } from '@ant-design/icons';
+import { PlusOutlined, SaveOutlined, ReloadOutlined, EditOutlined } from '@ant-design/icons';
 import { Link, useParams } from 'react-router-dom';
 import MapPanel from '../components/common/MapPanel';
 import MeasureInput from '../components/common/MeasureInput';
@@ -27,7 +28,7 @@ import FacilityIcon from '../components/common/FacilityIcon';
 import EmptyState from '../components/common/EmptyState';
 import { usePointStore } from '../stores/pointStore';
 import { OCCUPIED_LEVELS, type Inspection, type OccupiedLevel } from '../types/inspection';
-import type { RectifyPlan } from '../types/rectify';
+import { latestRecheck, type RecheckRecord, type RectifyPlan } from '../types/rectify';
 import { judgeInspection } from '../utils/routeCheck';
 import { addDays, isOverdue, todayStr } from '../utils/format';
 
@@ -48,6 +49,7 @@ export default function PointDetail() {
   const points = usePointStore((s) => s.points);
   const inspections = usePointStore((s) => s.inspections);
   const rectifies = usePointStore((s) => s.rectifies);
+  const rechecks = usePointStore((s) => s.rechecks);
   const loaded = usePointStore((s) => s.loaded);
   const addInspection = usePointStore((s) => s.addInspection);
   const addRectify = usePointStore((s) => s.addRectify);
@@ -65,6 +67,25 @@ export default function PointDetail() {
       rectifies.filter((r) => r.pointId === id).sort((a, b) => (a.deadline < b.deadline ? -1 : 1)),
     [rectifies, id],
   );
+
+  /** 本点位各整改条目的历次复检，按时间正序（早 → 晚） */
+  const recheckMap = useMemo(() => {
+    const planIds = new Set(plans.map((p) => p.id));
+    const map = new Map<string, RecheckRecord[]>();
+    for (const r of rechecks) {
+      if (!planIds.has(r.rectifyId)) continue;
+      const list = map.get(r.rectifyId);
+      if (list) list.push(r);
+      else map.set(r.rectifyId, [r]);
+    }
+    for (const list of map.values()) {
+      list.sort((a, b) => {
+        if (a.date !== b.date) return a.date < b.date ? -1 : 1;
+        return a.createdAt < b.createdAt ? -1 : a.createdAt > b.createdAt ? 1 : 0;
+      });
+    }
+    return map;
+  }, [rechecks, plans]);
 
   const [form, setForm] = useState<InlineInspection>(() => ({
     date: todayStr(),
@@ -184,11 +205,11 @@ export default function PointDetail() {
 
   const rectifyColumns: ColumnsType<RectifyPlan> = [
     { title: '整改要求', dataIndex: 'requirement', ellipsis: true },
-    { title: '责任单位', dataIndex: 'unit', width: 170 },
+    { title: '责任单位', dataIndex: 'unit', width: 160 },
     {
       title: '整改期限',
       dataIndex: 'deadline',
-      width: 130,
+      width: 120,
       render: (d: string, row) =>
         isOverdue(d, row.status) ? (
           <Space size={4}>
@@ -200,18 +221,70 @@ export default function PointDetail() {
         ),
     },
     {
-      title: '复检日期',
+      title: '复检次数',
+      width: 90,
+      render: (_, row) => {
+        const count = recheckMap.get(row.id)?.length ?? 0;
+        return count ? <Tag>{count} 次</Tag> : <Typography.Text type="secondary">未复检</Typography.Text>;
+      },
+    },
+    {
+      title: '最近复检',
       dataIndex: 'recheckDate',
-      width: 120,
+      width: 110,
       render: (v: string) => v || <Typography.Text type="secondary">未复检</Typography.Text>,
+    },
+    {
+      title: '最新复检说明',
+      width: 240,
+      render: (_, row) => {
+        const latest = latestRecheck(recheckMap.get(row.id) ?? []);
+        if (!latest) {
+          return <Typography.Text type="secondary">—</Typography.Text>;
+        }
+        return (
+          <Space size={4} wrap style={{ rowGap: 2 }}>
+            <Typography.Text ellipsis style={{ maxWidth: 160 }} title={latest.note}>
+              {latest.note || '（未填写说明）'}
+            </Typography.Text>
+            <Typography.Text type="secondary" className="gb-muted">
+              {latest.inspector || '未记录检查人'}
+            </Typography.Text>
+          </Space>
+        );
+      },
     },
     {
       title: '状态',
       dataIndex: 'status',
-      width: 100,
+      width: 90,
       render: (v: string) => <StatusBadge value={v} kind="rectify" />,
     },
   ];
+
+  const renderRecheckHistory = (row: RectifyPlan) => {
+    const history = recheckMap.get(row.id) ?? [];
+    if (!history.length) {
+      return <Typography.Text type="secondary">暂无复检记录</Typography.Text>;
+    }
+    return (
+      <Timeline
+        items={history.map((r) => ({
+          color: r.result === '已整改' ? 'green' : r.result === '复发' ? 'red' : 'orange',
+          children: (
+            <Space size={8} wrap style={{ rowGap: 2 }}>
+              <Typography.Text strong>{r.date}</Typography.Text>
+              <StatusBadge value={r.result} kind="rectify" />
+              <Typography.Text type="secondary" className="gb-muted">
+                检查人：{r.inspector || '未记录'}
+              </Typography.Text>
+              <Typography.Text>{r.note || '（未填写说明）'}</Typography.Text>
+            </Space>
+          ),
+        }))}
+      />
+    );
+  };
 
   const latest = history[0];
 
@@ -405,10 +478,36 @@ export default function PointDetail() {
         </Col>
       </Row>
 
-      <Card title="整改跟踪" size="small" style={{ marginTop: 16 }}>
+      <Card
+        title="整改跟踪"
+        size="small"
+        style={{ marginTop: 16 }}
+        extra={
+          <Link to="/rectify">
+            <Button size="small" type="link" icon={<EditOutlined />} data-testid="goto-recheck">
+              到整改清单登记复检
+            </Button>
+          </Link>
+        }
+      >
         <Divider style={{ margin: '0 0 12px' }} />
         {plans.length ? (
-          <Table<RectifyPlan> rowKey="id" size="small" pagination={false} dataSource={plans} columns={rectifyColumns} />
+          <Table<RectifyPlan>
+            rowKey="id"
+            size="small"
+            pagination={false}
+            dataSource={plans}
+            columns={rectifyColumns}
+            expandable={{
+              expandedRowRender: (row) => (
+                <div style={{ padding: '4px 0 4px 8px' }}>
+                  <Typography.Text strong>历次复检（按时间排列）</Typography.Text>
+                  <div style={{ marginTop: 8 }}>{renderRecheckHistory(row)}</div>
+                </div>
+              ),
+              rowExpandable: (row) => (recheckMap.get(row.id)?.length ?? 0) > 0,
+            }}
+          />
         ) : (
           <EmptyState
             title="暂无整改条目"

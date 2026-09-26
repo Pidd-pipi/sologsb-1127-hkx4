@@ -8,12 +8,14 @@ import EmptyState from '../components/common/EmptyState';
 import { usePointStore } from '../stores/pointStore';
 import { useUiStore } from '../stores/uiStore';
 import { FACILITY_TYPES, type AccessPoint } from '../types/point';
+import { latestRecheck } from '../types/rectify';
 import { isOverdue } from '../utils/format';
 
 export default function MapView() {
   const points = usePointStore((s) => s.points);
   const inspections = usePointStore((s) => s.inspections);
   const rectifies = usePointStore((s) => s.rectifies);
+  const rechecks = usePointStore((s) => s.rechecks);
   const typeFilter = useUiStore((s) => s.mapFacilityFilter);
   const setTypeFilter = useUiStore((s) => s.setMapFacilityFilter);
   const [activeId, setActiveId] = useState('');
@@ -34,6 +36,8 @@ export default function MapView() {
     ? inspections.filter((i) => i.pointId === active.id).sort((a, b) => (a.date < b.date ? 1 : -1))
     : [];
   const activePlans = active ? rectifies.filter((r) => r.pointId === active.id) : [];
+  const latestRecheckOf = (rectifyId: string) =>
+    latestRecheck(rechecks.filter((r) => r.rectifyId === rectifyId));
 
   const noteOf = (p: AccessPoint) => latestOf(p.id)?.conclusion ?? '未核验';
 
@@ -169,18 +173,33 @@ export default function MapView() {
             <Card size="small" title={`整改跟踪（${activePlans.length} 条）`}>
               {activePlans.length ? (
                 <Space direction="vertical" size={8} style={{ width: '100%' }}>
-                  {activePlans.map((r) => (
-                    <div key={r.id}>
-                      <Space size={8} wrap>
-                        <StatusBadge value={r.status} kind="rectify" />
-                        {isOverdue(r.deadline, r.status) ? <Tag color="error">已逾期</Tag> : null}
-                        <Typography.Text type="secondary" className="gb-muted">
-                          期限 {r.deadline}
-                        </Typography.Text>
-                      </Space>
-                      <div>{r.requirement}</div>
-                    </div>
-                  ))}
+                  {activePlans.map((r) => {
+                    const latest = latestRecheckOf(r.id);
+                    const count = rechecks.filter((x) => x.rectifyId === r.id).length;
+                    return (
+                      <div key={r.id}>
+                        <Space size={8} wrap>
+                          <StatusBadge value={r.status} kind="rectify" />
+                          {isOverdue(r.deadline, r.status) ? <Tag color="error">已逾期</Tag> : null}
+                          <Typography.Text type="secondary" className="gb-muted">
+                            期限 {r.deadline}
+                          </Typography.Text>
+                          {count > 0 ? <Tag>复检 {count} 次</Tag> : null}
+                        </Space>
+                        <div>{r.requirement}</div>
+                        {latest ? (
+                          <div className="gb-muted" style={{ marginTop: 2 }}>
+                            最新复检（{latest.date} · {latest.inspector || '未记录检查人'}）：
+                            {latest.note || '未填写说明'}
+                          </div>
+                        ) : (
+                          <div className="gb-muted" style={{ marginTop: 2 }}>
+                            尚未复检
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
                 </Space>
               ) : (
                 <EmptyState title="暂无整改条目" compact />
